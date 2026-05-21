@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Trace — Commerces sans site web</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <link rel="stylesheet" href="style.css" />
+  <script src="https://unpkg.com/three@0.160.0/build/three.min.js" defer></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.12.5/gsap.min.js" defer></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.12.5/Flip.min.js" defer></script>
+</head>
+<body>
+  <!-- BACKGROUND DECOR (animated blobs) -->
+  <div class="bg-decor" aria-hidden="true">
+    <div class="blob blob-1"></div>
+    <div class="blob blob-2"></div>
+    <div class="blob blob-3"></div>
+    <div class="blob blob-4"></div>
+  </div>
+
+  <!-- HEADER -->
+  <header class="header">
+    <div class="header-inner">
+      <div class="logo">
+        <div id="logoMount" class="logo-mark"></div>
+        <div class="logo-content">
+          <div class="logo-text">Trace</div>
+          <div class="logo-tagline">Commerces sans site web · Prospection terrain</div>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <!-- SEARCH PANEL -->
+  <section class="search-panel">
+    <form id="searchForm" class="search-form" autocomplete="off">
+
+      <div class="form-group">
+        <label for="cityInput">Zone géographique</label>
+        <div class="autocomplete-wrap">
+          <input type="text" id="cityInput" placeholder="Ex : Paris, Lyon 3e, Bordeaux..." required />
+          <ul id="cityDropdown" class="autocomplete-list hidden"></ul>
+        </div>
+        <input type="hidden" id="lat" />
+        <input type="hidden" id="lon" />
+      </div>
+
+      <div class="form-group">
+        <label for="radiusRange">Rayon</label>
+        <div class="range-wrap">
+          <input type="range" id="radiusRange" min="1" max="3" step="1" value="2" />
+          <span id="radiusLabel" class="range-value">2 km</span>
+        </div>
+      </div>
+
+      <div class="form-group">
+        <label for="typeSelect">Type de commerce</label>
+        <select id="typeSelect">
+          <option value="tous">Tous les commerces</option>
+          <option value="restaurant">Restaurant</option>
+          <option value="cafe">Bar / Café / Pub</option>
+          <option value="boulangerie">Boulangerie</option>
+          <option value="coiffeur">Coiffeur</option>
+          <option value="beaute">Institut de beauté</option>
+          <option value="boutique">Boutique / Mode</option>
+          <option value="epicerie">Épicerie / Supermarché</option>
+          <option value="pharmacie">Pharmacie</option>
+          <option value="medecin">Médecin / Dentiste</option>
+          <option value="hotel">Hôtel / Hébergement</option>
+          <option value="garage">Garage / Auto</option>
+          <option value="artisan">Artisan</option>
+        </select>
+      </div>
+
+      <details class="google-section">
+        <summary>
+          <span class="google-summary-text">Enrichir avec Google Places</span>
+          <span class="badge-optional">Optionnel</span>
+        </summary>
+        <div class="form-group">
+          <label for="googleKey">Clé API Google Places</label>
+          <input type="password" id="googleKey" placeholder="AIzaSy..." />
+          <small>Recherche Google Nearby Search en complément d'OSM. Filtre automatique des Instagram/Facebook utilisés comme "site web".</small>
+        </div>
+      </details>
+
+      <button type="submit" class="btn-search" id="searchBtn">
+        <span id="searchBtnLoader" class="spinner hidden"></span>
+        <span id="searchBtnText">Rechercher</span>
+        <svg class="btn-arrow" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg>
+      </button>
+    </form>
+  </section>
+
+  <!-- STATUS BAR -->
+  <div id="statusBar" class="status-bar hidden">
+    <div id="statusText"></div>
+    <div class="status-actions">
+      <button class="btn-export" id="exportBtn" onclick="exportCSV()">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+        Exporter CSV
+      </button>
+    </div>
+  </div>
+
+  <!-- MAIN CONTENT -->
+  <main class="main-content" id="mainContent" style="display:none">
+    <div class="split-view">
+      <!-- MAP -->
+      <div class="map-pane">
+        <div id="map"></div>
+        <div class="map-legend">
+          <span class="legend-item"><span class="legend-dot green"></span>Avec téléphone</span>
+          <span class="legend-item"><span class="legend-dot orange"></span>Sans téléphone</span>
+        </div>
+      </div>
+
+      <!-- TABLE -->
+      <div class="table-pane">
+        <div class="table-toolbar">
+          <input type="text" id="filterInput" placeholder="Filtrer par nom, ville..." class="filter-input" />
+          <span id="countBadge" class="count-badge">0 résultats</span>
+        </div>
+        <div class="table-wrap">
+          <table id="resultsTable">
+            <thead>
+              <tr>
+                <th><input type="checkbox" id="selectAll" title="Tout sélectionner" /></th>
+                <th data-sort="name">Nom <span class="sort-icon">↕</span></th>
+                <th data-sort="category">Type</th>
+                <th data-sort="address">Adresse</th>
+                <th data-sort="phone">Téléphone</th>
+                <th data-sort="manager">Gérant</th>
+              </tr>
+            </thead>
+            <tbody id="tableBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <!-- EMPTY STATE -->
+  <div id="emptyState" class="empty-state hidden">
+    <div class="state-icon">
+      <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
+    </div>
+    <p class="state-title">Aucun résultat dans cette zone</p>
+    <p class="state-sub">Essaie d'augmenter le rayon de recherche ou de changer le type de commerce.</p>
+  </div>
+
+  <!-- ERROR STATE -->
+  <div id="errorState" class="error-state hidden">
+    <div class="state-icon">
+      <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+    </div>
+    <p id="errorMsg"></p>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
