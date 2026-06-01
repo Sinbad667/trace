@@ -555,14 +555,13 @@ async function searchFromSIRENE(lat, lon, radiusKm, type, deadline) {
   return results;
 }
 
-// Classe les prospects du + pertinent au - pertinent pour de la prospection
-// terrain (porte-à-porte). Critères, par ordre d'importance :
-//  - proximité du point de recherche (on démarche d'abord ce qui est à côté) ;
-//  - fiche "vivante" : un commerce fermé/fantôme n'a en général ni téléphone,
-//    ni horaires, ni adresse complète → il retombe naturellement en bas ;
-//  - source : OSM (présence réelle + absence de site vérifiée) prime sur SIRENE
-//    (noms approximatifs, site non vérifié).
-// Attache aussi distanceKm à chaque résultat (utile au front).
+// Classe les prospects. Le critère N°1 de l'app est l'ABSENCE DE SITE WEB :
+// on remonte donc TOUJOURS en premier les commerces dont l'absence de site est
+// VÉRIFIÉE (OSM/Google : tag website réellement inspecté) avant ceux dont le site
+// n'a PAS été vérifié (SIRENE — beaucoup en ont en réalité un). La pertinence
+// (proximité + fiche vivante) ne sert qu'à départager À L'INTÉRIEUR de chaque
+// groupe, jamais à faire remonter un "site non vérifié" au-dessus d'un "sans site
+// confirmé". Attache aussi distanceKm à chaque résultat (utile au front).
 function rankByRelevance(businesses, centerLat, centerLon) {
   for (const b of businesses) {
     const d = (b.lat && b.lon)
@@ -570,17 +569,19 @@ function rankByRelevance(businesses, centerLat, centerLon) {
       : 99;
     b.distanceKm = Math.round(d * 100) / 100;
 
+    // Palier prioritaire : 0 = absence de site VÉRIFIÉE, 1 = site non vérifié.
+    b._verified = b.websiteUnknown ? 1 : 0;
+
     let score = -d * 10;          // chaque km d'éloignement coûte 10 pts
     if (b.phone) score += 25;     // joignable = exploitable tout de suite
     if (b.openingHours) score += 15; // horaires renseignés = fiche entretenue
     if (b.address) score += 8;
     if (b.manager) score += 6;
     if (b.socialMedia) score += 5;
-    if (b.source === 'OSM') score += 10;
-    if (b.websiteUnknown) score -= 8; // SIRENE : site non vérifié → moins sûr
     b._score = score;
   }
-  return businesses.sort((a, b) => b._score - a._score);
+  // Palier "sans site vérifié" d'abord ; pertinence ensuite.
+  return businesses.sort((a, b) => a._verified - b._verified || b._score - a._score);
 }
 
 /* ===== ROUTES ===== */
