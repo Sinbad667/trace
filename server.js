@@ -100,6 +100,20 @@ function cap(str) {
   return (str || '').charAt(0).toUpperCase() + (str || '').slice(1).toLowerCase();
 }
 
+// Retire les formes juridiques d'une dénomination légale pour l'affichage
+// (ex: "OLD WILD WEST SAS" → "OLD WILD WEST"). Préserve la casse.
+function stripLegalForm(name) {
+  return (name || '')
+    .replace(/\b(SARLU|SARL|SASU|SAS|EURL|SCEA|SELARL|SELAS|EARL|SNC|SCI|SCM|SA)\b/gi, ' ')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+}
+
+// Mots typiques des sociétés d'exploitation / holdings (ex: "JFPM GLOBAL",
+// "ADC RESEAU") : quand SIRENE n'a pas d'enseigne et qu'on tombe sur ce genre de
+// raison sociale, ce n'est pas un commerce prospectable → on l'écarte.
+const HOLDING_NAME_RE = /\b(HOLDING|GLOBAL|RESEAU|GROUPE|INVEST|INVESTISSEMENT|PARTICIPATION|PARTICIPATIONS|GESTION|FINANCE|FINANCIERE|PATRIMOINE|IMMOBILIER|IMMOBILIERE|CONSULTING|DEVELOPPEMENT)\b/i;
+
 // Filtres OSM par type de commerce (plus larges qu'avant)
 const OSM_TYPE_FILTERS = {
   restaurant:  '["amenity"~"restaurant|fast_food|food_court|biergarten"]',
@@ -163,8 +177,9 @@ async function queryOverpass(overpassQuery) {
   ];
   // On interroge les 3 endpoints EN PARALLÈLE et on garde la 1ère réponse valide.
   // Évite qu'un endpoint lent (overpass-api.de est souvent surchargé) n'affame les
-  // autres. Timeout généreux car les serveurs publics répondent souvent en 5-9s.
-  const timeout = 10000;
+  // autres. Timeout généreux : overpass-api.de répond en ~1s quand il va bien mais
+  // peut traîner 10-13s en charge ; couper trop tôt le fait échouer pour rien.
+  const timeout = 13000;
   const body = `data=${encodeURIComponent(overpassQuery)}`;
   const headers = { 'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': 'Trace/1.0' };
 
@@ -208,6 +223,11 @@ function extractBusinesses(elements) {
     // Si site web réel → exclure ce commerce
     if (rawWebsite && !hasSocialOnly) return null;
 
+    // Commerce explicitement fermé dans OSM (opening_hours=closed/off) → écarter :
+    // ce sont des fiches d'établissements disparus, inutiles pour la prospection.
+    const openingHours = tags.opening_hours || null;
+    if (openingHours && /^(closed|off)$/i.test(openingHours.trim())) return null;
+
     return {
       osmId: el.id,
       osmType: el.type, // 'node' ou 'way' — utile pour Nominatim lookup
@@ -231,6 +251,7 @@ function extractBusinesses(elements) {
       manager: null,
       source: 'OSM',
       socialMedia: hasSocialOnly ? rawWebsite : null,
+      openingHours,
     };
   }).filter(Boolean);
 }
@@ -472,31 +493,42 @@ async function searchFromSIRENE(lat, lon, radiusKm, type, deadline) {
   const results = [];
 
   for (const r of allItems) {
-    if (r.etat_administratif === 'F') continue;
+    // Société fermée / cessée au niveau de l'unité légale → exclure
+    if (r.etat_administratif !== 'A') continue;
     if (seen.has(r.siren)) continue;
 
-    // Trouve une localisation (siège OU établissement actif) dans le rayon.
-    // Indispensable pour les chaînes dont le siège est ailleurs mais qui ont
-    // un établissement local — sinon le filtre sur le siège les éliminerait.
-    const candidates = [r.siege, ...(r.matching_etablissements || [])]
-      .filter(c => c && c.etat_administratif !== 'F');
+    // Grandes entreprises et ETI : groupes de restauration collective, chaînes,
+    // sièges de cantines (ex: Sodexo déclaré en 56.10A) — jamais des prospects
+    // locaux, et tous équipés d'un site web. On les écarte.
+    if (r.categorie_entreprise === 'GE' || r.categorie_entreprise === 'ETI') continue;
+
+    // Localisation : on privilégie un ÉTABLISSEMENT (le commerce réel) ACTIF dans
+    // le rayon, et on ne retombe sur le siège qu'en dernier recours. On exclut les
+    // établissements fermés (etat F OU date_fermeture renseignée) pour ne pas
+    // remonter d'anciens points de vente disparus.
+    const candidates = [...(r.matching_etablissements || []), r.siege]
+      .filter(c => c && c.etat_administratif === 'A' && !c.date_fermeture);
     let loc = null;
-    let hadCoords = false;
     for (const c of candidates) {
       const la = parseFloat(c.latitude), lo = parseFloat(c.longitude);
-      if (la && lo) {
-        hadCoords = true;
-        if (haversineKm(lat, lon, la, lo) <= radiusKm) { loc = c; break; }
-      }
+      if (la && lo && haversineKm(lat, lon, la, lo) <= radiusKm) { loc = c; break; }
     }
-    // Au moins une localisation avait des coords mais aucune dans le rayon → hors zone
-    if (!loc && hadCoords) continue;
-    loc = loc || r.siege; // aucune coord exploitable → on garde avec le siège
+    // Aucun établissement actif géolocalisé dans le rayon → pas un commerce réel
+    // implanté sur place (siège ailleurs, activité sans point de vente…) → exclure
+    if (!loc) continue;
 
-    const lat2 = parseFloat(loc?.latitude);
-    const lon2 = parseFloat(loc?.longitude);
+    const lat2 = parseFloat(loc.latitude);
+    const lon2 = parseFloat(loc.longitude);
 
-    const tradeName = (loc?.liste_enseignes?.[0] || r.siege?.nom_commercial || r.nom_complet || '').trim();
+    // Nom : enseigne puis nom commercial de l'établissement retenu en priorité ;
+    // dénomination légale (sans forme juridique) seulement faute de mieux.
+    let tradeName = (loc.liste_enseignes?.[0] || loc.nom_commercial || '').trim();
+    if (!tradeName) {
+      // Pas d'enseigne : on retombe sur la raison sociale. Si elle ressemble à une
+      // société d'exploitation/holding, ce n'est pas un commerce réel → on écarte.
+      if (HOLDING_NAME_RE.test(r.nom_complet || '')) continue;
+      tradeName = stripLegalForm(r.nom_complet);
+    }
     if (!tradeName) continue;
 
     seen.add(r.siren);
@@ -509,10 +541,10 @@ async function searchFromSIRENE(lat, lon, radiusKm, type, deadline) {
       phone: null,
       website: null,
       email: null,
-      address: loc?.adresse || null,
-      codePostal: loc?.code_postal || null,
-      city: loc?.libelle_commune || null,
-      category: type === 'tous' ? (r.activite_principale || 'commerce') : type,
+      address: loc.adresse || null,
+      codePostal: loc.code_postal || null,
+      city: loc.libelle_commune || null,
+      category: type === 'tous' ? (loc.activite_principale || r.activite_principale || 'commerce') : type,
       manager: extractManagerInfo(r),
       siren: r.siren,
       source: 'SIRENE',
@@ -521,6 +553,34 @@ async function searchFromSIRENE(lat, lon, radiusKm, type, deadline) {
   }
 
   return results;
+}
+
+// Classe les prospects du + pertinent au - pertinent pour de la prospection
+// terrain (porte-à-porte). Critères, par ordre d'importance :
+//  - proximité du point de recherche (on démarche d'abord ce qui est à côté) ;
+//  - fiche "vivante" : un commerce fermé/fantôme n'a en général ni téléphone,
+//    ni horaires, ni adresse complète → il retombe naturellement en bas ;
+//  - source : OSM (présence réelle + absence de site vérifiée) prime sur SIRENE
+//    (noms approximatifs, site non vérifié).
+// Attache aussi distanceKm à chaque résultat (utile au front).
+function rankByRelevance(businesses, centerLat, centerLon) {
+  for (const b of businesses) {
+    const d = (b.lat && b.lon)
+      ? haversineKm(centerLat, centerLon, b.lat, b.lon)
+      : 99;
+    b.distanceKm = Math.round(d * 100) / 100;
+
+    let score = -d * 10;          // chaque km d'éloignement coûte 10 pts
+    if (b.phone) score += 25;     // joignable = exploitable tout de suite
+    if (b.openingHours) score += 15; // horaires renseignés = fiche entretenue
+    if (b.address) score += 8;
+    if (b.manager) score += 6;
+    if (b.socialMedia) score += 5;
+    if (b.source === 'OSM') score += 10;
+    if (b.websiteUnknown) score -= 8; // SIRENE : site non vérifié → moins sûr
+    b._score = score;
+  }
+  return businesses.sort((a, b) => b._score - a._score);
 }
 
 /* ===== ROUTES ===== */
@@ -549,12 +609,12 @@ app.get('/api/geocode', async (req, res) => {
 const searchCache = new Map();
 const CACHE_TTL = 60 * 60 * 1000; // 1h
 
-function cacheKey(lat, lon, radius, type) {
-  return `${(+lat).toFixed(3)}_${(+lon).toFixed(3)}_${radius}_${type || 'tous'}`;
+function cacheKey(lat, lon, radius, type, includeSirene) {
+  return `${(+lat).toFixed(3)}_${(+lon).toFixed(3)}_${radius}_${type || 'tous'}_${includeSirene ? 's1' : 's0'}`;
 }
 
 app.post('/api/search', async (req, res) => {
-  const { lat, lon, radius, type, googleApiKey } = req.body;
+  const { lat, lon, radius, type, includeSirene, googleApiKey } = req.body;
   if (!lat || !lon || !radius) {
     return res.status(400).json({ error: 'lat, lon et radius sont requis' });
   }
@@ -562,11 +622,12 @@ app.post('/api/search', async (req, res) => {
   // Rayon plafonné à 3 km : au-delà, les requêtes Overpass deviennent lourdes/instables.
   const radiusM = Math.min(Math.max(radius * 1000, 500), 3000);
   const useGoogle = !!(googleApiKey && googleApiKey.trim().length > 10);
+  const wantSirene = !!includeSirene;
   const startTime = Date.now();
-  const DEADLINE = startTime + 14000;
+  const DEADLINE = startTime + 23000;
 
   // Cache hit (uniquement pour les recherches sans clé Google)
-  const key = cacheKey(lat, lon, radius, type);
+  const key = cacheKey(lat, lon, radius, type, wantSirene);
   if (!useGoogle) {
     const cached = searchCache.get(key);
     if (cached && Date.now() - cached.ts < CACHE_TTL) {
@@ -576,6 +637,7 @@ app.post('/api/search', async (req, res) => {
         results: cached.businesses.slice(0, 500),
         overpassFailed: false,
         sireneFailed: false,
+        sireneFallback: false,
         cached: true,
       });
     }
@@ -585,62 +647,90 @@ app.post('/api/search', async (req, res) => {
     let businesses;
     let overpassFailed = false;
     let sireneFailed = false;
+    let sireneFallback = false;
 
     if (useGoogle) {
       businesses = await searchWithGoogle(lat, lon, radiusM, type || 'tous', googleApiKey.trim());
     } else {
-      // OSM + SIRENE en parallèle
+      // OSM est la source principale (vrais noms de façade, lieux réels, tag
+      // `website` fiable). SIRENE n'est interrogé qu'à la demande car ses noms
+      // sont approximatifs et il n'a aucune info de site web.
       const overpassQuery = buildOverpassQuery(lat, lon, radiusM, type || 'tous');
 
-      const [osmResult, sireneResult] = await Promise.allSettled([
-        queryOverpass(overpassQuery).then(data => extractBusinesses(data.elements || [])),
-        searchFromSIRENE(lat, lon, radiusM / 1000, type || 'tous', DEADLINE),
-      ]);
+      const tasks = [queryOverpass(overpassQuery).then(data => extractBusinesses(data.elements || []))];
+      if (wantSirene) {
+        tasks.push(searchFromSIRENE(lat, lon, radiusM / 1000, type || 'tous', DEADLINE));
+      }
+      const [osmResult, sireneResult] = await Promise.allSettled(tasks);
 
       const osmBusinesses = osmResult.status === 'fulfilled' ? osmResult.value : [];
       overpassFailed = osmResult.status === 'rejected';
       if (overpassFailed) console.warn('Overpass:', osmResult.reason?.message);
 
-      const sireneBusinesses = sireneResult.status === 'fulfilled' ? sireneResult.value : [];
-      sireneFailed = sireneResult.status === 'rejected';
-      if (sireneFailed) console.warn('SIRENE:', sireneResult.reason?.message);
+      if (!wantSirene) {
+        // Filet de sécurité : Overpass est instable. S'il tombe (ou ne renvoie
+        // rien), on interroge SIRENE pour ne jamais laisser l'utilisateur à 0,
+        // même si ses noms sont approximatifs. Signalé via sireneFallback.
+        if (overpassFailed || osmBusinesses.length === 0) {
+          try {
+            businesses = await searchFromSIRENE(lat, lon, radiusM / 1000, type || 'tous', DEADLINE);
+            sireneFallback = true;
+          } catch (err) {
+            console.warn('SIRENE fallback:', err.message);
+            sireneFailed = true;
+            businesses = osmBusinesses;
+          }
+        } else {
+          businesses = osmBusinesses;
+        }
+      } else {
+        const sireneBusinesses = sireneResult.status === 'fulfilled' ? sireneResult.value : [];
+        sireneFailed = sireneResult.status === 'rejected';
+        if (sireneFailed) console.warn('SIRENE:', sireneResult.reason?.message);
 
-      // Déduplication OSM↔SIRENE : même nom normalisé ET à moins de 200m.
-      // La vérification de distance évite d'éliminer un commerce SIRENE à cause
-      // d'un homonyme OSM situé ailleurs dans la commune.
-      const osmByName = new Map();
-      for (const b of osmBusinesses) {
-        const n = normName(b.name);
-        if (!osmByName.has(n)) osmByName.set(n, []);
-        osmByName.get(n).push(b);
+        // Déduplication OSM↔SIRENE : même nom normalisé ET à moins de 200m.
+        // La vérification de distance évite d'éliminer un commerce SIRENE à cause
+        // d'un homonyme OSM situé ailleurs dans la commune.
+        const osmByName = new Map();
+        for (const b of osmBusinesses) {
+          const n = normName(b.name);
+          if (!osmByName.has(n)) osmByName.set(n, []);
+          osmByName.get(n).push(b);
+        }
+        const sireneSupplement = sireneBusinesses.filter(b => {
+          const n = normName(b.name);
+          if (n.length <= 1) return false;
+          const osmMatches = osmByName.get(n);
+          if (!osmMatches) return true;
+          return !osmMatches.some(o =>
+            b.lat && b.lon && o.lat && o.lon &&
+            haversineKm(b.lat, b.lon, o.lat, o.lon) < 0.2
+          );
+        });
+
+        businesses = [...osmBusinesses, ...sireneSupplement];
       }
-      const sireneSupplement = sireneBusinesses.filter(b => {
-        const n = normName(b.name);
-        if (n.length <= 1) return false;
-        const osmMatches = osmByName.get(n);
-        if (!osmMatches) return true;
-        return !osmMatches.some(o =>
-          b.lat && b.lon && o.lat && o.lon &&
-          haversineKm(b.lat, b.lon, o.lat, o.lon) < 0.2
-        );
-      });
-
-      businesses = [...osmBusinesses, ...sireneSupplement];
     }
 
+    // Tri par pertinence : les prospects les plus exploitables (proches, fiche
+    // vivante) d'abord. Indispensable AVANT la coupe à 500 pour ne pas écarter de
+    // bons prospects au profit de fiches vides/fermées.
+    businesses = rankByRelevance(businesses, lat, lon);
+
     // On ne cache que les recherches complètes — sinon on figerait un résultat
-    // dégradé (ex: Overpass tombé) pendant 1h.
-    if (!useGoogle && !overpassFailed && !sireneFailed) {
+    // dégradé (Overpass tombé, ou repli SIRENE) pendant 1h.
+    if (!useGoogle && !overpassFailed && !sireneFailed && !sireneFallback) {
       searchCache.set(key, { businesses, ts: Date.now() });
     }
 
     const elapsed = Math.round((Date.now() - startTime) / 1000);
-    console.log(`Search done in ${elapsed}s — ${businesses.length} results`);
+    console.log(`Search done in ${elapsed}s — ${businesses.length} results${sireneFallback ? ' (repli SIRENE)' : ''}`);
     res.json({
       count: businesses.length,
       results: businesses.slice(0, 500),
       overpassFailed,
       sireneFailed,
+      sireneFallback,
     });
   } catch (err) {
     console.error(err.message);

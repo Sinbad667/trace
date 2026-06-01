@@ -200,7 +200,7 @@ function bindEvents() {
   });
   cityInput.addEventListener('blur', () => setTimeout(hideDropdown, 200));
 
-  document.getElementById('filterInput').addEventListener('input', e => applyFilter(e.target.value));
+  document.getElementById('filterInput').addEventListener('input', () => applyFilter());
 
   document.getElementById('selectAll').addEventListener('change', e => {
     document.querySelectorAll('.row-check').forEach(cb => cb.checked = e.target.checked);
@@ -216,10 +216,11 @@ function bindEvents() {
   });
 
   document.getElementById('tableBody').addEventListener('click', e => {
-    const btn = e.target.closest('.load-manager-btn');
-    if (!btn) return;
-    e.stopPropagation();
-    loadManager(btn);
+    const mgrBtn = e.target.closest('.load-manager-btn');
+    if (mgrBtn) {
+      e.stopPropagation();
+      loadManager(mgrBtn);
+    }
   });
 }
 
@@ -245,6 +246,16 @@ async function loadManager(btn) {
   } catch {
     cell.innerHTML = '<span class="no-data">Erreur</span>';
   }
+}
+
+/* ===== WEBSITE CHECK (recherche web en un clic) ===== */
+// Les moteurs de recherche bloquent l'accès automatisé côté serveur. On délègue
+// donc la vérif au navigateur de l'utilisateur : un clic ouvre la recherche du
+// commerce, il voit en un coup d'œil s'il a un site.
+function renderVerifyCell(biz) {
+  const q = encodeURIComponent(`${biz.name} ${biz.city || biz.codePostal || ''}`.trim());
+  const url = `https://www.google.com/search?q=${q}`;
+  return `<td><a class="verify-btn" href="${url}" target="_blank" rel="noopener" title="Ouvrir la recherche Google pour ce commerce">Chercher ↗</a></td>`;
 }
 
 /* ===== GEOCODE AUTOCOMPLETE ===== */
@@ -303,6 +314,7 @@ async function handleSearch(e) {
   const lon = parseFloat(document.getElementById('lon').value);
   const radius = parseFloat(document.getElementById('radiusRange').value);
   const type = document.getElementById('typeSelect').value;
+  const includeSirene = document.getElementById('includeSirene').checked;
   const googleApiKey = document.getElementById('googleKey').value.trim();
 
   lastSearchParams = { lat, lon, radius };
@@ -316,13 +328,13 @@ async function handleSearch(e) {
   }
 
   const controller = new AbortController();
-  const fetchTimeout = setTimeout(() => controller.abort(), 16000);
+  const fetchTimeout = setTimeout(() => controller.abort(), 25000);
 
   try {
     const res = await fetch('/api/search', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ lat, lon, radius, type, googleApiKey }),
+      body: JSON.stringify({ lat, lon, radius, type, includeSirene, googleApiKey }),
       signal: controller.signal,
     });
 
@@ -333,23 +345,25 @@ async function handleSearch(e) {
       throw new Error(err.error || 'Erreur serveur');
     }
 
-    const { count, results, overpassFailed, sireneFailed } = await res.json();
+    const { count, results, overpassFailed, sireneFailed, sireneFallback } = await res.json();
     allResults = results;
 
     if (!count) {
       if (overpassFailed && sireneFailed) {
         showError('Les APIs publiques (OpenStreetMap + recherche-entreprises) sont injoignables. Réessaie dans quelques minutes.');
       } else if (overpassFailed) {
-        showError('OpenStreetMap est injoignable et le registre SIRENE n\'a rien trouvé. Réessaie ou élargis le rayon.');
+        showError('OpenStreetMap est injoignable et le registre SIRENE n\'a rien trouvé non plus. Réessaie ou élargis le rayon.');
       } else if (sireneFailed) {
-        showError('Le registre SIRENE est injoignable et OpenStreetMap n\'a rien trouvé. Réessaie ou élargis le rayon.');
+        showError('OpenStreetMap n\'a rien trouvé et le registre SIRENE est injoignable. Réessaie ou élargis le rayon.');
       } else {
         document.getElementById('emptyState').classList.remove('hidden');
       }
     } else {
       filteredResults = [...allResults];
       renderAll();
-      if (overpassFailed || sireneFailed) {
+      if (sireneFallback) {
+        showError('OpenStreetMap est temporairement injoignable — résultats issus du registre SIRENE (noms approximatifs, site non vérifié). Réessaie plus tard pour la liste OSM complète.');
+      } else if (overpassFailed || sireneFailed) {
         const which = overpassFailed && sireneFailed ? 'OpenStreetMap et SIRENE' : overpassFailed ? 'OpenStreetMap' : 'SIRENE';
         showError(`${which} injoignable — résultats incomplets. Réessaie pour récupérer le reste.`);
       }
@@ -432,6 +446,8 @@ function renderTable(rows) {
       ? `<td class="manager-cell">${esc(biz.manager)}</td>`
       : `<td><button class="load-manager-btn" data-name="${esc(biz.name)}" data-cp="${esc(biz.codePostal || '')}" data-city="${esc(biz.city || '')}" data-key="${esc(String(biz.osmId || ''))}">Charger</button></td>`;
 
+    const verifyCell = renderVerifyCell(biz);
+
     tr.innerHTML = `
       <td><input type="checkbox" class="row-check" /></td>
       <td title="${esc(biz.name)}">${esc(biz.name)} ${socialBadge}${sourceBadge}</td>
@@ -441,6 +457,7 @@ function renderTable(rows) {
         ? `<a class="phone-link" href="tel:${esc(biz.phone)}">${esc(biz.phone)}</a>`
         : '<span class="no-data">—</span>'}</td>
       ${managerCell}
+      ${verifyCell}
     `;
 
     tr.addEventListener('click', e => {
@@ -523,8 +540,8 @@ function flyToMarker(biz) {
 }
 
 /* ===== FILTER ===== */
-function applyFilter(query) {
-  const q = query.toLowerCase().trim();
+function applyFilter() {
+  const q = (document.getElementById('filterInput').value || '').toLowerCase().trim();
   filteredResults = q
     ? allResults.filter(b =>
         (b.name || '').toLowerCase().includes(q) ||

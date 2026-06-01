@@ -76,6 +76,14 @@
         </select>
       </div>
 
+      <label class="sirene-opt">
+        <input type="checkbox" id="includeSirene" />
+        <span class="sirene-opt-text">
+          Élargir avec le registre SIRENE
+          <small>Plus de résultats, mais noms approximatifs et site web non vérifié</small>
+        </span>
+      </label>
+
       <details class="google-section">
         <summary>
           <span class="google-summary-text">Enrichir avec Google Places</span>
@@ -135,6 +143,7 @@
                 <th data-sort="address">Adresse</th>
                 <th data-sort="phone">Téléphone</th>
                 <th data-sort="manager">Gérant</th>
+                <th>Vérifier</th>
               </tr>
             </thead>
             <tbody id="tableBody"></tbody>
