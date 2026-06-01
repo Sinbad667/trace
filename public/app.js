@@ -253,7 +253,10 @@ async function loadManager(btn) {
 // donc la vérif au navigateur de l'utilisateur : un clic ouvre la recherche du
 // commerce, il voit en un coup d'œil s'il a un site.
 function renderVerifyCell(biz) {
-  const q = encodeURIComponent(`${biz.name} ${biz.city || biz.codePostal || ''}`.trim());
+  // Ville du commerce si connue, sinon la ville recherchée (souvent absente des
+  // fiches OSM/Google) → la recherche Google porte toujours sur "nom + ville".
+  const place = biz.city || (lastSearchParams && lastSearchParams.city) || biz.codePostal || '';
+  const q = encodeURIComponent(`${biz.name} ${place}`.trim());
   const url = `https://www.google.com/search?q=${q}`;
   return `<td><a class="verify-btn" href="${url}" target="_blank" rel="noopener" title="Ouvrir la recherche Google pour ce commerce">Chercher ↗</a></td>`;
 }
@@ -317,7 +320,7 @@ async function handleSearch(e) {
   const includeSirene = document.getElementById('includeSirene').checked;
   const googleApiKey = document.getElementById('googleKey').value.trim();
 
-  lastSearchParams = { lat, lon, radius };
+  lastSearchParams = { lat, lon, radius, city: document.getElementById('cityInput').value.trim() };
   setLoading(true);
   hideAll();
 
